@@ -468,8 +468,15 @@ gdix51c0_open_thread (gpointer user_data)
 
   complete->dev = g_object_ref (open_thread->dev);
   if (!gdix51c0_session_activate (self, &complete->error))
-    fp_warn ("gdix51c0: background warm activation failed: %s",
-             complete->error ? complete->error->message : "?");
+    {
+      /* open_complete_main decides success from the error alone; a failure
+       * without one would be reported as a ready warm session. */
+      if (!complete->error)
+        g_set_error_literal (&complete->error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                             "gdix51c0: warm activation failed without an error");
+      fp_warn ("gdix51c0: background warm activation failed: %s",
+               complete->error->message);
+    }
 
   g_main_context_invoke_full (
     open_thread->context,
@@ -1445,7 +1452,8 @@ gdix51c0_session_tls_start (FpiDeviceGdix51c0 *self,
   {
     g_autoptr(GError) rec_err = NULL;
     if (!gdix51c0_recover_psk_from_mcu (&bus, mcu_psk, &mcu_present, &rec_err))
-      fp_info ("gdix51c0: sensor PSK recovery unavailable: %s", rec_err->message);
+      fp_info ("gdix51c0: sensor PSK recovery unavailable: %s",
+               rec_err ? rec_err->message : "?");
   }
 
   /* Select the PSK for this session: just-provisioned > env/persisted >
@@ -3412,14 +3420,11 @@ gdix51c0_capture_image_raw (FpiDeviceGdix51c0 *self,
        * record) — the Goodix request cmd byte (0x22 / 0x20) is what we
        * SEND, not what we receive in the response payload. */
       gdix51c0_listener_drain_cmd (self->listener, 0x17);
-      gdix51c0_listener_arm_suppress_on_ack (self->listener, TRUE);
 
-      if (!gdix51c0_listener_send_ack (self->listener,
-                                       img_setmode, sizeof (img_setmode),
-                                       "img-setmode", &local_error))
+      if (!gdix51c0_listener_send_ack_quiet (self->listener,
+                                             img_setmode, sizeof (img_setmode),
+                                             "img-setmode", &local_error))
         {
-          gdix51c0_listener_arm_suppress_on_ack (self->listener, FALSE);
-          gdix51c0_listener_set_suppress (self->listener, FALSE);
           g_propagate_error (error, g_steal_pointer (&local_error));
           return NULL;
         }
