@@ -62,6 +62,8 @@ struct _FpiDeviceGdix51c0
   /* TLS state (populated for each enroll/verify/identify session) */
   Gdix51c0Tls                   tls;
   gboolean                   tls_ready;
+  /* Monotonic time of the last activity on the live TLS session. */
+  gint64                     last_tls_activity_usec;
 
   gboolean                   skip_next_identify;
   gboolean                   session_desynced;
@@ -1546,6 +1548,7 @@ gdix51c0_session_tls_start (FpiDeviceGdix51c0 *self,
   }
 
   self->tls_ready = TRUE;
+  self->last_tls_activity_usec = g_get_monotonic_time ();
   fp_dbg ("gdix51c0: TLS ready; capture listener not started yet");
   return TRUE;
 }
@@ -2015,6 +2018,27 @@ gdix51c0_session_activate_once (FpiDeviceGdix51c0 *self, GError **error)
   return TRUE;
 }
 
+/* A failed T0 prime leaves the MCU inside its image path; the retry loop
+ * below must run the full bring-up rather than reuse that session. */
+static gboolean
+gdix51c0_reuse_or_fallback_to_reinit (FpiDeviceGdix51c0 *self)
+{
+  g_autoptr(GError) prime_error = NULL;
+
+  gdix51c0_session_reset_capture_state (self);
+  fp_dbg ("gdix51c0: reusing active TLS session");
+
+  if (self->image_base_refreshed_this_open ||
+      gdix51c0_session_prime_t0 (self, &prime_error))
+    return TRUE;
+
+  fp_warn ("gdix51c0: priming reused TLS session failed (%s); "
+           "forcing full re-initialization",
+           prime_error ? prime_error->message : "?");
+  gdix51c0_session_deactivate (self);
+  return FALSE;
+}
+
 static gboolean
 gdix51c0_session_activate_with_attempts (FpiDeviceGdix51c0 *self,
                                          guint              max_attempts,
@@ -2027,12 +2051,30 @@ gdix51c0_session_activate_with_attempts (FpiDeviceGdix51c0 *self,
 
   if (self->tls_ready)
     {
-      gdix51c0_session_reset_capture_state (self);
-      fp_dbg ("gdix51c0: reusing active TLS session");
-      if (!self->image_base_refreshed_this_open &&
-          !gdix51c0_session_prime_t0 (self, error))
-        return FALSE;
-      return TRUE;
+      /* Opt-in: proactively reinitializing a live session is the fragile
+       * path.  Capture-time command timeouts restart the session on demand. */
+      gint64 idle_restart_sec =
+        gdix51c0_env_int ("GDIX51C0_TLS_IDLE_RESTART_SEC", 0);
+      gint64 idle_usec = self->last_tls_activity_usec > 0
+                         ? g_get_monotonic_time () - self->last_tls_activity_usec
+                         : 0;
+
+      if (idle_restart_sec > 0 && idle_usec > idle_restart_sec * G_USEC_PER_SEC)
+        {
+          /* The MCU can stop answering after a long idle period while the
+           * host still holds tls_ready.  Tear the session down so the loop
+           * below runs the full boot-probe/TLS bring-up that is known to
+           * recover the sensor. */
+          fp_warn ("gdix51c0: TLS session idle for %" G_GINT64_FORMAT
+                   " ms; forcing full re-initialization",
+                   idle_usec / 1000);
+          gdix51c0_session_deactivate (self);
+        }
+      else
+        {
+          if (gdix51c0_reuse_or_fallback_to_reinit (self))
+            return TRUE;
+        }
     }
 
   while (failures < max_attempts)
@@ -3620,7 +3662,8 @@ gdix51c0_capture_error_needs_session_restart (const GError *error)
    * current TLS/session is not trustworthy anymore.
    */
   if (error->message &&
-      (strstr (error->message, "image read failed after setmode ACK") ||
+      (strstr (error->message, "timed out awaiting cmd 0xb0") ||
+       strstr (error->message, "image read failed after setmode ACK") ||
        strstr (error->message, "image data IRQ did not arrive after setmode ACK") ||
        strstr (error->message, "FDT lost sync")))
     return TRUE;
@@ -3793,6 +3836,19 @@ gdix51c0_wait_for_lift_report (FpiDeviceGdix51c0 *self,
         {
           fp_dbg ("gdix51c0: FDT-up did not observe lift; requiring FDT-down zero-touch gap");
           self->require_lift_gap = TRUE;
+          g_clear_error (&lift_err);
+          gdix51c0_report_finger_status_on_main (self, FP_FINGER_STATUS_NONE);
+          return TRUE;
+        }
+
+      if (g_error_matches (lift_err, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        {
+          /* fprintd cancels the action as soon as it has a result, which is
+           * common while the finger is still down.  Tearing the MCU down with
+           * a hard reset here repeatedly left the next TLS bring-up failing,
+           * so keep the session and let the warm-session idle close or the
+           * capture restart path deal with it. */
+          fp_dbg ("gdix51c0: lift wait cancelled; keeping TLS session");
           g_clear_error (&lift_err);
           gdix51c0_report_finger_status_on_main (self, FP_FINGER_STATUS_NONE);
           return TRUE;
@@ -4011,6 +4067,7 @@ gdix51c0_verify_or_identify (FpDevice            *dev,
   gboolean saw_valid_probe = FALSE;
   gboolean transient_failure = FALSE;
   gboolean lift_cleanup_ok = TRUE;
+  gboolean finger_timeout = FALSE;
   FpiMatchResult final_verify_result = FPI_MATCH_FAIL;
   FpPrint *final_identify_match = NULL;
   FpPrint *updated_print = NULL;
@@ -4209,6 +4266,8 @@ gdix51c0_verify_or_identify (FpDevice            *dev,
     }
 
 out:
+  if (self->tls_ready)
+    self->last_tls_activity_usec = g_get_monotonic_time ();
   g_clear_pointer (&probe, goodix_chicago_runtime_probe_free);
   transient_failure = gdix51c0_error_is_transient_verify_failure (error);
   if (transient_failure)
@@ -4236,13 +4295,25 @@ out:
       else if (reported_match || self->session_desynced)
         gdix51c0_report_finger_status_on_main (self, FP_FINGER_STATUS_NONE);
       else
-        lift_cleanup_ok = gdix51c0_wait_for_lift_report (
-          self, GDIX51C0_LIFT_CLEANUP_TIMEOUT_USEC, FALSE);
+        {
+          /* A no-match commonly happens with the finger still down.  Running
+           * the FDT-up lift wait here issues a burst of transactions that
+           * frequently leaves the MCU unresponsive, so keep the warm session
+           * and require a zero-touch gap before accepting the next press. */
+          self->require_lift_gap = TRUE;
+          gdix51c0_report_finger_status_on_main (self, FP_FINGER_STATUS_NONE);
+        }
     }
-  if (error || self->session_desynced || !lift_cleanup_ok)
+  /* An unattended VerifyStart that never saw a finger leaves the session
+   * untouched; recycling it here would force the next claim through the
+   * slow, failure-prone cold bring-up. */
+  finger_timeout = error && error->message &&
+    strstr (error->message, "no finger detected within timeout");
+  if ((error && !finger_timeout) || self->session_desynced || !lift_cleanup_ok)
     gdix51c0_session_deactivate (self);
   else if (!reported_match)
-    fp_dbg ("gdix51c0: keeping TLS session active after clean no-match");
+    fp_dbg ("gdix51c0: keeping TLS session active after %s",
+            finger_timeout ? "finger timeout" : "clean no-match");
 
   if (transient_failure)
     g_clear_error (&error);

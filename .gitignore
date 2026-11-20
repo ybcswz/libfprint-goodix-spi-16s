@@ -22,3 +22,7 @@
 *.gzf
 *.so
 *.so.*
+
+# IDE local state
+/.idea/
+/*.iml
