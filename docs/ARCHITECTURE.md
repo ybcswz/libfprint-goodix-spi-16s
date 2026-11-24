@@ -87,7 +87,16 @@ prepares TLS and T0 during enumeration, retains a clean session across
 Claim/Release, closes it for suspend, and prewarms it again after resume. The
 warm path runs the normal no-finger T0 calibration pass, but does not arm
 FDT-down, wait for a finger, or invoke matching; those remain inside an
-authorized action. It targets fprintd `v1.94.5` and is installed by default;
+authorized action. Keeping the sensor warm is time-limited: the installed
+drop-in sets `FPRINTD_WARM_IDLE_SECONDS=300`, because an open session that
+stays idle for roughly twenty minutes leaves the MCU answering nothing (and
+the LPSS SPI controller wedged) until the host is reinitialized. After the
+idle close the next Claim runs the same cold boot-probe path as a reboot.
+If a full activation still fails, the driver power-cycles the LPSS SPI
+controller (sysfs unbind/bind), re-requests the IRQ line, and retries the
+activation once: after a long stall the controller can wedge so that the MCU
+reset line has no effect, and only a controller power cycle restores the bus.
+It targets fprintd `v1.94.5` and is installed by default;
 `./install.sh --without-fprintd` is the explicit opt-out. Libfprint upgrades
 do not require rebasing it unless fprintd's ownership or callback lifecycle
 also changes.

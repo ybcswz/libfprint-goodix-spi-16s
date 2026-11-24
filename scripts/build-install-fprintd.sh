@@ -16,6 +16,16 @@ LIBFPRINT_INSTALL_DIR="${LIBFPRINT_INSTALL_DIR:-$PROJECT_INSTALL_ROOT/libfprint}
 DROPIN_DIR="${FPRINTD_DROPIN_DIR:-/etc/systemd/system/fprintd.service.d}"
 DROPIN="${FPRINTD_DROPIN:-$DROPIN_DIR/30-goodix-spi-adaptive.conf}"
 RESTART="${FPRINTD_RESTART:-1}"
+# A long-lived warm session leaves the MCU answering nothing; close it well
+# before the observed ~20-minute stall so the next Claim cold-boots instead.
+WARM_IDLE_SECONDS="${FPRINTD_WARM_IDLE_SECONDS:-300}"
+
+case "$WARM_IDLE_SECONDS" in
+  ''|*[!0-9]*)
+    printf 'Error: FPRINTD_WARM_IDLE_SECONDS must be a non-negative integer.\n' >&2
+    exit 2
+    ;;
+esac
 
 run_root() {
   if [ "${EUID:-$(id -u)}" -eq 0 ]; then "$@"; else sudo "$@"; fi
@@ -79,6 +89,7 @@ trap 'rm -f "$DROPIN_TMP"' EXIT
   printf 'Environment=LD_LIBRARY_PATH=%s\n' "$LIBFPRINT_INSTALL_DIR"
   printf 'Environment=FPRINTD_KEEP_WARM_DRIVERS=gdix51c0\n'
   printf 'Environment=GDIX51C0_WARM_SESSION=1\n'
+  printf 'Environment=FPRINTD_WARM_IDLE_SECONDS=%s\n' "$WARM_IDLE_SECONDS"
 } > "$DROPIN_TMP"
 
 run_root install -d "$INSTALL_DIR" "$DROPIN_DIR"

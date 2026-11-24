@@ -46,6 +46,7 @@ struct _FpiDeviceGdix51c0
 
   /* hardware handles */
   int                        spi_fd;
+  char                      *spi_path;
   struct gpiod_chip         *gpio_chip;
   struct gpiod_line_request *irq_req;
   unsigned int               irq_offset;
@@ -492,6 +493,196 @@ gdix51c0_open_thread (gpointer user_data)
 /* Device open/close                                                   */
 /* ------------------------------------------------------------------ */
 
+static gboolean
+gdix51c0_spi_open (FpiDeviceGdix51c0 *self, GError **error)
+{
+  /* Match Python: 10 MHz, mode 0, 8 bits/word.  Without this we inherit
+   * whatever the kernel set the fd to.  GDIX51C0_SPI_SPEED_HZ env lets us sweep
+   * the bus clock — some Chicago parts derive the internal readout clock from
+   * SPI, so this is the last knob for the 0x0b78 readout cliff. */
+  guint32 speed = (guint32) GDIX51C0_DEV_ENV_INT ("GDIX51C0_SPI_SPEED_HZ",
+                                                  GDIX51C0_SPI_SPEED_HZ);
+  fp_dbg ("gdix51c0: SPI speed = %u Hz", speed);
+  guint8  mode  = GDIX51C0_SPI_MODE;
+  guint8  bpw   = 8;
+
+  self->spi_fd = open (self->spi_path, O_RDWR);
+  if (self->spi_fd < 0)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "gdix51c0: open spidev %s failed", self->spi_path);
+      return FALSE;
+    }
+
+  if (ioctl (self->spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0 ||
+      ioctl (self->spi_fd, SPI_IOC_WR_MODE,         &mode)  < 0 ||
+      ioctl (self->spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bpw)  < 0)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "gdix51c0: spidev configure failed");
+      close (self->spi_fd);
+      self->spi_fd = -1;
+      return FALSE;
+    }
+
+  /* Read back to confirm the kernel honored what we asked for. */
+  guint32 actual_speed = 0;
+  guint8  actual_mode  = 0xff;
+  guint8  actual_bpw   = 0;
+  ioctl (self->spi_fd, SPI_IOC_RD_MAX_SPEED_HZ, &actual_speed);
+  ioctl (self->spi_fd, SPI_IOC_RD_MODE,         &actual_mode);
+  ioctl (self->spi_fd, SPI_IOC_RD_BITS_PER_WORD, &actual_bpw);
+  fp_dbg ("gdix51c0: spidev configured: speed=%u Hz mode=0x%02x bpw=%u",
+          actual_speed, actual_mode, actual_bpw);
+
+  return TRUE;
+}
+
+static gboolean
+gdix51c0_sysfs_write (const char *path, const char *value, GError **error)
+{
+  int fd = open (path, O_WRONLY | O_CLOEXEC);
+  ssize_t written;
+
+  if (fd < 0)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "gdix51c0: open %s failed", path);
+      return FALSE;
+    }
+
+  written = write (fd, value, strlen (value));
+  if (written < 0)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "gdix51c0: write %s failed", path);
+      close (fd);
+      return FALSE;
+    }
+  close (fd);
+  return TRUE;
+}
+
+/* After a long idle the LPSS controller can wedge so that no command is ever
+ * ACKed again and the MCU reset line has no effect; only a controller
+ * unbind/bind (which power-cycles the bus side) restores the sensor.  Rebuild
+ * the spidev handle on top of that so the activation loop can retry. */
+static gboolean
+gdix51c0_spi_controller_power_cycle (FpiDeviceGdix51c0 *self, GError **error)
+{
+  g_autofree char *node = NULL;
+  g_autofree char *device_link = NULL;
+  g_autofree char *device_dir = NULL;
+  g_autofree char *controller_dir_unresolved = NULL;
+  g_autofree char *controller_dir = NULL;
+  g_autofree char *controller_name = NULL;
+  g_autofree char *driver_link = NULL;
+  g_autofree char *driver_dir = NULL;
+  g_autofree char *driver_name = NULL;
+  g_autofree char *unbind_path = NULL;
+  g_autofree char *bind_path = NULL;
+  gboolean present = FALSE;
+
+  if (!self->spi_path)
+    {
+      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                           "gdix51c0: cannot power-cycle SPI: spidev path unknown");
+      return FALSE;
+    }
+
+  node = g_path_get_basename (self->spi_path);
+  device_link = g_strdup_printf ("/sys/class/spidev/%s/device", node);
+  device_dir = realpath (device_link, NULL);
+  if (!device_dir)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "gdix51c0: resolve %s failed", device_link);
+      return FALSE;
+    }
+
+  controller_dir_unresolved = g_build_filename (device_dir, "..", "..", "..",
+                                              NULL);
+  controller_dir = realpath (controller_dir_unresolved, NULL);
+  if (!controller_dir)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "gdix51c0: resolve SPI controller failed");
+      return FALSE;
+    }
+  controller_name = g_path_get_basename (controller_dir);
+
+  driver_link = g_build_filename (controller_dir, "driver", NULL);
+  driver_dir = realpath (driver_link, NULL);
+  if (!driver_dir)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "gdix51c0: SPI controller %s has no bound driver",
+                   controller_name);
+      return FALSE;
+    }
+  driver_name = g_path_get_basename (driver_dir);
+
+  if (self->spi_fd >= 0)
+    {
+      close (self->spi_fd);
+      self->spi_fd = -1;
+    }
+
+  unbind_path = g_strdup_printf ("/sys/bus/platform/drivers/%s/unbind",
+                                 driver_name);
+  bind_path = g_strdup_printf ("/sys/bus/platform/drivers/%s/bind",
+                               driver_name);
+
+  fp_warn ("gdix51c0: power-cycling SPI controller %s (%s)",
+           controller_name, driver_name);
+
+  if (!gdix51c0_sysfs_write (unbind_path, controller_name, error))
+    return FALSE;
+
+  /* udev must retire the old spidev node before the controller can probe
+   * again; writing "bind" into a still-unwinding driver returns -EBUSY. */
+  for (guint i = 0; i < 20; i++)
+    {
+      if (access (self->spi_path, R_OK) != 0)
+        break;
+      g_usleep (100000);
+    }
+  g_usleep (200000);
+
+  if (!gdix51c0_sysfs_write (bind_path, controller_name, error))
+    return FALSE;
+
+  for (guint i = 0; i < 30; i++)
+    {
+      if (access (self->spi_path, R_OK) == 0)
+        {
+          present = TRUE;
+          break;
+        }
+      g_usleep (100000);
+    }
+  if (!present)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
+                   "gdix51c0: %s did not return after controller rebind",
+                   self->spi_path);
+      return FALSE;
+    }
+
+  if (!gdix51c0_spi_open (self, error))
+    return FALSE;
+
+  /* The IRQ line request survives the controller rebind, but its kernel edge
+   * state does not: re-request the lines so a stale queued edge can no longer
+   * be mistaken for (or shadow) the MCU's next ACK. */
+  gdix51c0_close_gpios (self);
+  if (!gdix51c0_open_gpios (self, error))
+    return FALSE;
+
+  gdix51c0_irq_drain (self->irq_req, self->irq_events);
+  return TRUE;
+}
+
 static void
 gdix51c0_open (FpDevice *dev)
 {
@@ -518,44 +709,13 @@ gdix51c0_open (FpDevice *dev)
       return;
     }
 
-  self->spi_fd = open (spi_path, O_RDWR);
-  if (self->spi_fd < 0)
+  g_free (self->spi_path);
+  self->spi_path = g_strdup (spi_path);
+  if (!gdix51c0_spi_open (self, &err))
     {
-      g_set_error (&err, G_IO_ERROR, g_io_error_from_errno (errno),
-                   "gdix51c0: open spidev %s failed", spi_path);
       fpi_device_open_complete (dev, err);
       return;
     }
-
-  /* Match Python: 10 MHz, mode 0, 8 bits/word.  Without this we inherit
-   * whatever the kernel set the fd to.  GDIX51C0_SPI_SPEED_HZ env lets us sweep
-   * the bus clock — some Chicago parts derive the internal readout clock from
-   * SPI, so this is the last knob for the 0x0b78 readout cliff. */
-  guint32 speed = (guint32) GDIX51C0_DEV_ENV_INT ("GDIX51C0_SPI_SPEED_HZ",
-                                                  GDIX51C0_SPI_SPEED_HZ);
-  fp_dbg ("gdix51c0: SPI speed = %u Hz", speed);
-  guint8  mode  = GDIX51C0_SPI_MODE;
-  guint8  bpw   = 8;
-  if (ioctl (self->spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0 ||
-      ioctl (self->spi_fd, SPI_IOC_WR_MODE,         &mode)  < 0 ||
-      ioctl (self->spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bpw)  < 0)
-    {
-      g_set_error (&err, G_IO_ERROR, g_io_error_from_errno (errno),
-                   "gdix51c0: spidev configure failed");
-      close (self->spi_fd);
-      self->spi_fd = -1;
-      fpi_device_open_complete (dev, err);
-      return;
-    }
-  /* Read back to confirm the kernel honored what we asked for. */
-  guint32 actual_speed = 0;
-  guint8  actual_mode  = 0xff;
-  guint8  actual_bpw   = 0;
-  ioctl (self->spi_fd, SPI_IOC_RD_MAX_SPEED_HZ, &actual_speed);
-  ioctl (self->spi_fd, SPI_IOC_RD_MODE,         &actual_mode);
-  ioctl (self->spi_fd, SPI_IOC_RD_BITS_PER_WORD, &actual_bpw);
-  fp_dbg ("gdix51c0: spidev configured: speed=%u Hz mode=0x%02x bpw=%u",
-          actual_speed, actual_mode, actual_bpw);
 
   if (!gdix51c0_open_gpios (self, &err))
     {
@@ -2054,6 +2214,7 @@ gdix51c0_session_activate_with_attempts (FpiDeviceGdix51c0 *self,
 {
   guint failures = 0;
   gboolean repair_budget_granted = FALSE;
+  gboolean controller_power_cycled = FALSE;
 
   max_attempts = MAX (max_attempts, 1);
 
@@ -2129,6 +2290,27 @@ gdix51c0_session_activate_with_attempts (FpiDeviceGdix51c0 *self,
 
       if (failures == max_attempts)
         {
+          if (!controller_power_cycled &&
+              !gdix51c0_action_check_cancelled (self, error))
+            {
+              g_autoptr(GError) cycle_error = NULL;
+
+              controller_power_cycled = TRUE;
+              fp_warn ("gdix51c0: activation exhausted %u attempts (%s); "
+                       "power-cycling the SPI controller and retrying",
+                       max_attempts,
+                       local_error ? local_error->message : "?");
+              if (gdix51c0_spi_controller_power_cycle (self, &cycle_error))
+                {
+                  g_clear_error (&local_error);
+                  failures = 0;
+                  max_attempts = 4;
+                  continue;
+                }
+              fp_warn ("gdix51c0: SPI controller recovery failed: %s",
+                       cycle_error ? cycle_error->message : "?");
+            }
+
           g_propagate_error (error, g_steal_pointer (&local_error));
           return FALSE;
         }
@@ -4073,6 +4255,7 @@ gdix51c0_verify_or_identify (FpDevice            *dev,
   gboolean transient_failure = FALSE;
   gboolean lift_cleanup_ok = TRUE;
   gboolean finger_timeout = FALSE;
+  guint session_restarts = 0;
   FpiMatchResult final_verify_result = FPI_MATCH_FAIL;
   FpPrint *final_identify_match = NULL;
   FpPrint *updated_print = NULL;
@@ -4115,6 +4298,32 @@ gdix51c0_verify_or_identify (FpDevice            *dev,
 
       if (!raw)
         {
+          if (error &&
+              session_restarts < 2 &&
+              gdix51c0_capture_error_needs_session_restart (error))
+            {
+              /* The sensor drops off the bus after a long idle period while
+               * fprintd keeps the warm claim open, so the first post-idle
+               * press can fail before any frame is captured.  The retry-capture
+               * path has no internal restart, and letting the error escape
+               * leaves the lock screen unable to authenticate.  Rebuild the
+               * session and start the capture sequence over on the same press. */
+              session_restarts++;
+              fp_warn ("gdix51c0: %s lost the sensor session (%s); "
+                       "reinitializing (%u/2) and restarting capture",
+                       kind == GDIX51C0_ACTION_VERIFY ? "verify" : "identify",
+                       error->message, session_restarts);
+              g_clear_error (&error);
+              gdix51c0_session_deactivate (self);
+
+              if (!gdix51c0_session_activate (self, &error))
+                goto out;
+
+              gdix51c0_report_finger_status_on_main (self, FP_FINGER_STATUS_NEEDED);
+              attempt = 0;   /* the fresh session must start with a finger wait */
+              continue;
+            }
+
           if (error)
             goto out;
           break;
@@ -4540,6 +4749,7 @@ fpi_device_gdix51c0_finalize (GObject *gobject)
   FpiDeviceGdix51c0 *self = FPI_DEVICE_GDIX51C0 (gobject);
 
   gdix51c0_session_deactivate (self);
+  g_clear_pointer (&self->spi_path, g_free);
   g_clear_pointer (&self->action_context, g_main_context_unref);
   g_clear_object (&self->action_cancellable);
   G_OBJECT_CLASS (fpi_device_gdix51c0_parent_class)->finalize (gobject);
